@@ -1,0 +1,154 @@
+name: Reusable Governed Tag Release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Pushed release tag to validate and release.
+        required: true
+        type: string
+      version-file:
+        description: "Tagged source file containing `version: X.Y.Z` metadata."
+        required: false
+        default: SKILL.md
+        type: string
+      bootstrap-release:
+        description: Whether this is the approved first governed release with no prior release-note baseline.
+        required: true
+        type: boolean
+      previous-governed-tag:
+        description: Required for non-bootstrap releases; prior approved governed release tag.
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Governed tag release
+    runs-on: ubuntu-latest
+    concurrency:
+      group: governed-release-${{ github.repository }}-${{ inputs.tag }}
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+      VERSION_FILE: ${{ inputs.version-file }}
+      BOOTSTRAP_RELEASE: ${{ inputs.bootstrap-release }}
+      PREVIOUS_GOVERNED_TAG: ${{ inputs.previous-governed-tag }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Validate the immutable release target
+        id: validation
+        run: |
+          set -euo pipefail
+
+          semver_tag_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$'
+          if ! [[ "$TAG" =~ $semver_tag_pattern ]]; then
+            echo "Release tags must be canonical v-prefixed SemVer: $TAG"
+            exit 1
+          fi
+
+          git fetch --force --tags origin
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git ls-remote --tags origin "refs/tags/$TAG" | grep -Fq "refs/tags/$TAG"; then
+            echo "The pushed tag is not present on origin: $TAG"
+            exit 1
+          fi
+          if [ "$(git cat-file -t "refs/tags/$TAG")" != "tag" ]; then
+            echo "Release tags must be annotated: $TAG"
+            exit 1
+          fi
+
+          tag_target="$(git rev-parse "refs/tags/$TAG^{}")"
+          main_target="$(git rev-parse origin/main)"
+          if [ "$tag_target" != "$main_target" ]; then
+            echo "Release tag must target current origin/main HEAD."
+            exit 1
+          fi
+
+          if [ ! -f "$VERSION_FILE" ]; then
+            echo "Version file does not exist: $VERSION_FILE"
+            exit 1
+          fi
+          version_count="$(grep -Ec '^version: [^[:space:]]+$' "$VERSION_FILE" || true)"
+          if [ "$version_count" != "1" ]; then
+            echo "Version file must contain exactly one version field: $VERSION_FILE"
+            exit 1
+          fi
+          source_version="$(sed -nE 's/^version: ([^[:space:]]+)$/\1/p' "$VERSION_FILE")"
+          if [ "$source_version" != "${TAG#v}" ]; then
+            echo "Tag $TAG does not match $VERSION_FILE version $source_version"
+            exit 1
+          fi
+
+          if [ "$BOOTSTRAP_RELEASE" = "true" ]; then
+            if [ "$TAG" != "v1.4.3" ] || [ -n "$PREVIOUS_GOVERNED_TAG" ]; then
+              echo "Only v1.4.3 may use the governed bootstrap release path."
+              exit 1
+            fi
+          else
+            if [ -z "$PREVIOUS_GOVERNED_TAG" ]; then
+              echo "A non-bootstrap release requires previous-governed-tag."
+              exit 1
+            fi
+            if ! [[ "$PREVIOUS_GOVERNED_TAG" =~ $semver_tag_pattern ]]; then
+              echo "Previous governed tag is not canonical SemVer: $PREVIOUS_GOVERNED_TAG"
+              exit 1
+            fi
+            if [ "$(git cat-file -t "refs/tags/$PREVIOUS_GOVERNED_TAG" 2>/dev/null || true)" != "tag" ]; then
+              echo "Previous governed tag must exist as an annotated tag: $PREVIOUS_GOVERNED_TAG"
+              exit 1
+            fi
+            previous_target="$(git rev-parse "refs/tags/$PREVIOUS_GOVERNED_TAG^{}")"
+            if ! git merge-base --is-ancestor "$previous_target" "$tag_target"; then
+              echo "Previous governed tag must be an ancestor of the release target."
+              exit 1
+            fi
+            gh release view "$PREVIOUS_GOVERNED_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null
+          fi
+
+          echo "tag_target=$tag_target" >> "$GITHUB_OUTPUT"
+      - name: Handle an existing release idempotently
+        id: existing_release
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "A release already exists for immutable tag $TAG; treating this run as a no-op."
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create bootstrap release
+        if: steps.existing_release.outputs.exists == 'false' && inputs.bootstrap-release
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$TAG" \
+            --notes "Governed release cutover: this accepted v1.4.3 release starts the tag-owned release lineage. Historic v1.5.0 and v1.6.0-beta.1 are intentionally not used as a release-note baseline."
+      - name: Create stable release with generated notes
+        if: steps.existing_release.outputs.exists == 'false' && !inputs.bootstrap-release && !contains(inputs.tag, '-')
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$TAG" \
+            --generate-notes \
+            --notes-start-tag "$PREVIOUS_GOVERNED_TAG"
+      - name: Create prerelease with generated notes
+        if: steps.existing_release.outputs.exists == 'false' && !inputs.bootstrap-release && contains(inputs.tag, '-')
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$TAG" \
+            --prerelease \
+            --generate-notes \
+            --notes-start-tag "$PREVIOUS_GOVERNED_TAG"

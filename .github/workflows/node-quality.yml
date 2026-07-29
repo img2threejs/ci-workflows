@@ -1,0 +1,58 @@
+name: Reusable Node Quality
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Exact Node.js version used by the caller.
+        required: true
+        type: string
+      checkout-fetch-depth:
+        description: Checkout history depth; use 0 when a validation needs the PR merge base.
+        required: false
+        default: "1"
+        type: string
+      post-build-check:
+        description: Allowlisted post-build validation (`none` or `showcase-safety`).
+        required: false
+        default: none
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Node quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: ${{ inputs.checkout-fetch-depth }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - name: Run allowlisted post-build check
+        env:
+          POST_BUILD_CHECK: ${{ inputs.post-build-check }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          case "$POST_BUILD_CHECK" in
+            none)
+              exit 0
+              ;;
+            showcase-safety)
+              if [ -z "$BASE_REF" ]; then
+                echo "showcase-safety requires a pull request base ref."
+                exit 1
+              fi
+              node scripts/check-showcase-safety.mjs --base "$BASE_REF"
+              ;;
+            *)
+              echo "Unsupported post-build-check: $POST_BUILD_CHECK"
+              exit 1
+              ;;
+          esac
