@@ -1,0 +1,163 @@
+name: Reusable npm Publish
+
+# Publishes a caller's package to the npm registry for an already-created release tag. Like
+# `governed-tag-release.yml`, this workflow never calculates a version, creates or moves tags, commits
+# source, or edits a changelog: it validates that the tag, the caller's version file, and
+# `package.json` already agree, then publishes what the tag points at.
+#
+# Tests run in a separate job that has no access to the npm token, so a caller-supplied
+# `test-command` can never read the publish credential.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Pushed release tag to validate and publish.
+        required: true
+        type: string
+      version-file:
+        description: "Tagged source file containing `version: X.Y.Z` metadata."
+        required: true
+        type: string
+      node-version:
+        description: Exact Node.js version used to publish.
+        required: true
+        type: string
+      python-version:
+        description: Exact Python version used by the pre-publish test command.
+        required: true
+        type: string
+      test-command:
+        description: Repository-owned test command that must pass before publishing.
+        required: true
+        type: string
+    secrets:
+      npm-token:
+        description: npm automation or granular access token with publish rights.
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Pre-publish tests
+    runs-on: ubuntu-latest
+    # No npm token is exposed to this job. The caller owns `test-command`, so it must not run in a
+    # job that can read the publish credential.
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ inputs.python-version }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Run caller test command
+        run: ${{ inputs.test-command }}
+
+  publish:
+    name: npm publish
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # required for `npm publish --provenance`
+    concurrency:
+      group: npm-publish-${{ github.repository }}-${{ inputs.tag }}
+      cancel-in-progress: false
+    env:
+      TAG: ${{ inputs.tag }}
+      VERSION_FILE: ${{ inputs.version-file }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          registry-url: https://registry.npmjs.org
+
+      - name: Validate tag against package.json and the version file
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          semver_tag_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$'
+          if ! [[ "$TAG" =~ $semver_tag_pattern ]]; then
+            echo "Tag is not canonical v-prefixed SemVer: $TAG"
+            exit 1
+          fi
+          tag_version="${TAG#v}"
+
+          if [ ! -f package.json ]; then
+            echo "package.json does not exist at $TAG; nothing to publish."
+            exit 1
+          fi
+          package_name="$(node -p 'require("./package.json").name')"
+          package_version="$(node -p 'require("./package.json").version || ""')"
+          if [ "$package_version" != "$tag_version" ]; then
+            echo "Tag $TAG does not match package.json version ${package_version:-<absent>}"
+            exit 1
+          fi
+
+          if [ ! -f "$VERSION_FILE" ]; then
+            echo "Version file does not exist: $VERSION_FILE"
+            exit 1
+          fi
+          version_count="$(grep -Ec '^version: [^[:space:]]+$' "$VERSION_FILE" || true)"
+          if [ "$version_count" != "1" ]; then
+            echo "Version file must contain exactly one version field: $VERSION_FILE"
+            exit 1
+          fi
+          source_version="$(sed -nE 's/^version: ([^[:space:]]+)$/\1/p' "$VERSION_FILE")"
+          if [ "$source_version" != "$tag_version" ]; then
+            echo "Tag $TAG does not match $VERSION_FILE version $source_version"
+            exit 1
+          fi
+
+          # A lifecycle script would execute on every consumer install, including every `npx`
+          # invocation by someone who has not read this package.
+          for hook in preinstall install postinstall prepare; do
+            if [ "$(node -p "String(Boolean((require('./package.json').scripts||{})['$hook']))")" = "true" ]; then
+              echo "package.json declares a '$hook' script; refusing to publish."
+              exit 1
+            fi
+          done
+
+          # The dist-tag is the prerelease identifier, so `-beta.N` publishes under `beta` and
+          # `-rc.N` under `rc`; a stable tag publishes under `latest`.
+          if [[ "$tag_version" == *-* ]]; then
+            prerelease="${tag_version#*-}"
+            dist_tag="${prerelease%%.*}"
+          else
+            dist_tag=latest
+          fi
+
+          echo "name=$package_name" >> "$GITHUB_OUTPUT"
+          echo "version=$tag_version" >> "$GITHUB_OUTPUT"
+          echo "dist_tag=$dist_tag" >> "$GITHUB_OUTPUT"
+          echo "Publishing $package_name@$tag_version under dist-tag $dist_tag"
+
+      - name: Check whether this version is already published
+        id: existing
+        env:
+          NAME: ${{ steps.resolve.outputs.name }}
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -uo pipefail
+          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "$NAME@$VERSION is already published; re-running this tag is a no-op."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish
+        if: steps.existing.outputs.exists == 'false'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.npm-token }}
+          DIST_TAG: ${{ steps.resolve.outputs.dist_tag }}
+        run: npm publish --provenance --access public --tag "$DIST_TAG"
