@@ -16,7 +16,7 @@ on:
         required: true
         type: string
       version-file:
-        description: "Tagged source file containing `version: X.Y.Z` metadata."
+        description: "Tagged source file containing `version: X.Y.Z` metadata, or a `.json` file with a top-level `version` field."
         required: true
         type: string
       node-version:
@@ -107,12 +107,23 @@ jobs:
             echo "Version file does not exist: $VERSION_FILE"
             exit 1
           fi
-          version_count="$(grep -Ec '^version: [^[:space:]]+$' "$VERSION_FILE" || true)"
-          if [ "$version_count" != "1" ]; then
-            echo "Version file must contain exactly one version field: $VERSION_FILE"
-            exit 1
-          fi
-          source_version="$(sed -nE 's/^version: ([^[:space:]]+)$/\1/p' "$VERSION_FILE")"
+          case "$VERSION_FILE" in
+            *.json)
+              source_version="$(node -p 'require("./" + process.env.VERSION_FILE).version || ""')"
+              if [ -z "$source_version" ]; then
+                echo "Version file has no version field: $VERSION_FILE"
+                exit 1
+              fi
+              ;;
+            *)
+              version_count="$(grep -Ec '^version: [^[:space:]]+$' "$VERSION_FILE" || true)"
+              if [ "$version_count" != "1" ]; then
+                echo "Version file must contain exactly one version field: $VERSION_FILE"
+                exit 1
+              fi
+              source_version="$(sed -nE 's/^version: ([^[:space:]]+)$/\1/p' "$VERSION_FILE")"
+              ;;
+          esac
           if [ "$source_version" != "$tag_version" ]; then
             echo "Tag $TAG does not match $VERSION_FILE version $source_version"
             exit 1
