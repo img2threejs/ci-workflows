@@ -1,12 +1,76 @@
-name: Reusable npm Publish
+name: Reusable npm Publish (OIDC)
 
-# Publishes a caller's package to the npm registry for an already-created release tag. Like
-# `governed-tag-release.yml`, this workflow never calculates a version, creates or moves tags, commits
-# source, or edits a changelog: it validates that the tag, the caller's version file, and
-# `package.json` already agree, then publishes what the tag points at.
+# Publishes a caller's package to the npm registry using npm trusted publishing (OIDC). It never
+# calculates a version, creates or moves tags, commits source, or edits a changelog: it validates
+# that the tag (after stripping the configured prefix), the caller's repo-root `version-file`,
+# and `package.json` (under `package-directory`) all agree, then publishes the exact tarball
+# that the build job produced.
 #
-# Tests run in a separate job that has no access to the npm token, so a caller-supplied
-# `test-command` can never read the publish credential.
+# The shared workflow is OIDC-only. There is no `NPM_TOKEN` fallback and no `npm-token` secret
+# on the `workflow_call` interface. Callers MUST configure a Trusted Publisher on the registry
+# for the matching (npm org, npm package, GitHub org, GitHub repo, caller workflow filename,
+# tag prefix) tuple before activating this workflow.
+#
+# Design (two jobs)
+# - `build`: read-only checkout at the tag, runs setup-node + setup-python at the exact
+#   versions the caller passes, validates tag/SemVer/package.json/version-file with a single
+#   consolidated Node script that performs path containment, canonicalisation, hook refusal,
+#   and dist-tag derivation in one pass. Then installs dependencies (lockfile-aware:
+#   `npm ci --ignore-scripts` when a lockfile is present, otherwise
+#   `npm install --ignore-scripts --no-audit --no-fund`), runs the caller's `test-command`
+#   against the SAME working tree, packs with `npm pack --ignore-scripts --json`, hashes the
+#   tarball with SHA512, validates the pack JSON against the approved name/version, and
+#   uploads BOTH the tarball artifact AND a `release-metadata` artifact (filename, size,
+#   sha512 in canonical 'sha512-' + base64 SRI form, approved name/version, dist-tag). The
+#   build job does NOT have `id-token: write`.
+# - `publish`: runs setup-node at the exact version, downloads both artifacts, asserts exactly
+#   one tarball exists, re-derives sha512 of the local tarball and compares against the
+#   artifact metadata, then probes the EXACT-VERSION endpoint
+#   `https://registry.npmjs.org/<encoded-name>/<encoded-version>` — 404 is the only absence
+#   signal; 200 means the version is already published. On 200, asserts name/version and
+#   re-fetches the tarball from the registry's `dist.tarball` and re-hashes for byte-level
+#   integrity. On 404, runs `npm publish --ignore-scripts --access public --tag "$DIST_TAG"
+#   [--provenance] <tarball>`. The publish job does NOT execute caller scripts and does
+#   NOT reinstall dependencies.
+#
+# Provenance and private repos
+# - npm provenance is supported ONLY when BOTH the GitHub source repository AND the npm package
+#   are public. A private source repository CANNOT carry provenance regardless of the npm
+#   package's public/private state, and a private npm package cannot carry provenance
+#   regardless of source visibility. The `provenance` input MUST be `false` for any caller
+#   whose source repo is private (the `plugin-environment-release` env CLI is the current
+#   example) or whose npm package is private. `NPM_CONFIG_PROVENANCE` is set explicitly so
+#   npm never auto-attaches provenance.
+#
+# Tag prefix and dist-tag
+# - `tag-prefix` (default `v`): leading prefix stripped before SemVer validation. Caller
+#   convention is `v` for harness/core packages and `cli-v` for installer/CLI wrapper
+#   packages. The remainder MUST be strict SemVer (https://semver.org/spec/v2.0.0.html):
+#   numeric prerelease identifiers MUST NOT carry leading zeros; build metadata is stripped
+#   before dist-tag selection.
+# - dist-tag derivation: stable tag → `latest`. When the prerelease's first identifier is
+#   alphanumeric (e.g. `beta`, `rc`, `alpha`), that identifier is the dist-tag. When the
+#   first identifier is purely numeric, the channel name `prerelease` is used because npm
+#   rejects numeric-only dist-tags (`-1.beta`, `-0.3.7`, `-1.0` all map to `prerelease`).
+#
+# Node / npm runtime guarantees
+# - npm trusted publishers (OIDC) require Node >= 22.14 and npm >= 11.5.1
+#   (https://docs.npmjs.com/trusted-publishers/). Both jobs pin Node via
+#   `actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4` using the caller-
+#   supplied exact `node-version`. The build job also pins Python via
+#   `actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5`. Both jobs verify
+#   the npm version is >= 11.5.1 with native tuple comparison; no third-party deps.
+#
+# Lifecycle scripts
+# - The package MUST NOT declare `preinstall`, `install`, `postinstall`, `prepare`,
+#   `prepack`, `postpack`, `prepublish`, `prepublishOnly`, or `postpublish`. Install runs
+#   with `--ignore-scripts`; pack runs with `--ignore-scripts`.
+#
+# Path containment
+# - `package-directory` and `version-file` MUST be repo-root-relative (no leading `/`, no
+#   `..`). `fs.realpathSync` resolves both the repo root and the candidate path; the
+#   candidate MUST start with the resolved repo root. `package-directory` MAY equal the
+#   repo root (i.e. `.`).
 
 on:
   workflow_call:
@@ -15,12 +79,22 @@ on:
         description: Pushed release tag to validate and publish.
         required: true
         type: string
+      tag-prefix:
+        description: "Leading tag prefix stripped before SemVer validation (e.g. `v` or `cli-v`)."
+        required: false
+        default: 'v'
+        type: string
       version-file:
-        description: "Tagged source file containing `version: X.Y.Z` metadata, or a `.json` file with a top-level `version` field."
+        description: "Tagged source file containing `version: X.Y.Z` metadata (markdown), or a `.json` file with a top-level `version` field. Path is repo-root-relative."
         required: true
         type: string
+      package-directory:
+        description: "Caller-owned subdirectory (repo-root-relative) that contains `package.json` and the package source. May be `.`."
+        required: false
+        default: '.'
+        type: string
       node-version:
-        description: Exact Node.js version used to publish.
+        description: Exact Node.js version used in build and publish. Node >= 22.14 required for npm trusted publishers.
         required: true
         type: string
       python-version:
@@ -31,144 +105,444 @@ on:
         description: Repository-owned test command that must pass before publishing.
         required: true
         type: string
-    secrets:
-      npm-token:
-        description: npm automation or granular access token with publish rights.
-        required: true
+      provenance:
+        description: "When `true` (default), publish with `--provenance`. MUST be `false` for private source repos or private npm packages."
+        required: false
+        default: 'true'
+        type: string
 
 permissions:
   contents: read
 
 jobs:
-  test:
-    name: Pre-publish tests
+  build:
+    name: Build, test, pack
     runs-on: ubuntu-latest
-    # No npm token is exposed to this job. The caller owns `test-command`, so it must not run in a
-    # job that can read the publish credential.
+    permissions:
+      contents: read
+    outputs:
+      name: ${{ steps.resolve.outputs.name }}
+      version: ${{ steps.resolve.outputs.version }}
+      dist_tag: ${{ steps.resolve.outputs.dist_tag }}
+    env:
+      TAG: ${{ inputs.tag }}
+      TAG_PREFIX: ${{ inputs.tag-prefix }}
+      VERSION_FILE: ${{ inputs.version-file }}
+      PACKAGE_DIRECTORY: ${{ inputs.package-directory }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           ref: ${{ inputs.tag }}
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
-        with:
-          python-version: ${{ inputs.python-version }}
+
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ inputs.node-version }}
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Verify npm runtime meets trusted publisher minimum
+        run: |
+          set -euo pipefail
+          node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major < 22 || (major === 22 && minor < 14)) throw Error("Node >=22.14 required");'
+          IFS=. read -r npm_major npm_minor npm_patch <<<"$(npm -v)"
+          if [ "$npm_major" -lt 11 ] || { [ "$npm_major" = "11" ] && { [ "$npm_minor" -lt 5 ] || { [ "$npm_minor" = "5" ] && [ "$npm_patch" -lt 1 ]; }; }; }; then
+            echo "npm >= 11.5.1 required for npm trusted publishers; found $(npm -v)"
+            exit 1
+          fi
+          echo "npm $(npm -v) OK."
+
+      - name: Validate tag, paths, package.json, version file, hooks
+        id: resolve
+        env:
+          REPO_ROOT: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          'use strict';
+          const fs = require('fs');
+          const path = require('path');
+
+          function out(k, v) {
+            const line = `${k}=${v}`;
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, line + '\n');
+          }
+          function die(msg) { console.error(msg); process.exit(1); }
+
+          const repoRoot = path.resolve(process.env.REPO_ROOT);
+          const realRoot = fs.realpathSync.native(repoRoot);
+
+          const tag = process.env.TAG;
+          const tagPrefix = process.env.TAG_PREFIX;
+          const pkgDir = process.env.PACKAGE_DIRECTORY;
+          const verFile = process.env.VERSION_FILE;
+
+          // tag-prefix: non-empty identifier-ish.
+          if (!/^[A-Za-z0-9_-]+$/.test(tagPrefix)) die('tag-prefix invalid: ' + tagPrefix);
+          if (!tag.startsWith(tagPrefix)) die('Tag does not begin with required prefix ' + tagPrefix + ': ' + tag);
+          const tagVersion = tag.slice(tagPrefix.length);
+
+          // Strict SemVer. Numeric identifiers (MAJOR/MINOR/PATCH and any numeric
+          // prerelease identifier) MUST NOT carry leading zeros.
+          const numericIdent = '(?:0|[1-9][0-9]*)';
+          const prereleaseIdent = '(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)';
+          const prerelease = '(?:-' + prereleaseIdent + '(?:\\.' + prereleaseIdent + ')*)?';
+          const build = '(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?';
+          const semver = new RegExp('^' + numericIdent + '\\.' + numericIdent + '\\.' + numericIdent + prerelease + build + '$');
+          if (!semver.test(tagVersion)) die('Tag ' + tag + ' is not strict SemVer after prefix: ' + tagVersion);
+
+          // Path containment: package-directory MUST be relative, no leading /, no '..'.
+          if (path.isAbsolute(pkgDir)) die('package-directory must be repo-root-relative: ' + pkgDir);
+          if (pkgDir.split(/[\\/]+/).includes('..')) die('package-directory must not contain .. segments: ' + pkgDir);
+          const realPkgDir = pkgDir === '.'
+            ? realRoot
+            : fs.realpathSync.native(path.resolve(realRoot, pkgDir));
+          if (!(realPkgDir === realRoot || realPkgDir.startsWith(realRoot + path.sep))) {
+            die('package-directory resolves outside repo root: ' + realPkgDir);
+          }
+
+          // Path containment: version-file MUST be relative, no leading /, no '..'.
+          if (path.isAbsolute(verFile)) die('version-file must be repo-root-relative: ' + verFile);
+          if (verFile.split(/[\\/]+/).includes('..')) die('version-file must not contain .. segments: ' + verFile);
+          const realVerFile = fs.realpathSync.native(path.resolve(realRoot, verFile));
+          if (!realVerFile.startsWith(realRoot + path.sep)) {
+            die('version-file resolves outside repo root: ' + realVerFile);
+          }
+
+          // Load package.json (under package-directory).
+          const pkgPath = path.join(realPkgDir, 'package.json');
+          if (!fs.existsSync(pkgPath)) die('package.json does not exist: ' + pkgPath);
+          const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+          if (typeof pkg.name !== 'string' || !/^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/.test(pkg.name)) die('package.json has an invalid npm name');
+          if (!pkg.version || typeof pkg.version !== 'string') die('package.json missing version');
+          if (pkg.version !== tagVersion) die('Tag ' + tag + ' does not match package.json version ' + pkg.version);
+
+          // Load version-file (repo-root-relative).
+          let sourceVersion;
+          if (verFile.endsWith('.json')) {
+            const v = JSON.parse(fs.readFileSync(realVerFile, 'utf8'));
+            if (!v.version || typeof v.version !== 'string') die('version-file has no top-level version: ' + verFile);
+            sourceVersion = v.version;
+          } else {
+            const text = fs.readFileSync(realVerFile, 'utf8');
+            const matches = text.match(/^version:\s*(\S+)\s*$/gm) || [];
+            if (matches.length !== 1) die('version-file must contain exactly one version field: ' + verFile);
+            sourceVersion = matches[0].replace(/^version:\s*/, '').trim();
+          }
+          if (!sourceVersion) die('version-file parsed empty version: ' + verFile);
+          if (sourceVersion !== tagVersion) die('Tag ' + tag + ' does not match ' + verFile + ' version ' + sourceVersion);
+
+          // Refuse lifecycle hooks.
+          const banned = ['preinstall', 'install', 'postinstall', 'prepare', 'prepack', 'postpack', 'prepublish', 'prepublishOnly', 'postpublish'];
+          for (const hook of banned) {
+            if (pkg.scripts && typeof pkg.scripts[hook] === 'string' && pkg.scripts[hook].length > 0) {
+              die('package.json declares a \'' + hook + '\' script; refusing to publish.');
+            }
+          }
+
+          // dist-tag derivation: build metadata stripped; numeric first identifier => 'prerelease'.
+          const versionForTag = tagVersion.split('+')[0];
+          let distTag = 'latest';
+          if (versionForTag.includes('-')) {
+            const prereleasePart = versionForTag.split('-').slice(1).join('-');
+            const firstIdent = prereleasePart.split('.')[0];
+            if (/^[0-9]+$/.test(firstIdent)) {
+              distTag = 'prerelease';
+              console.log('Numeric prerelease first identifier; using channel prerelease.');
+            } else {
+              distTag = firstIdent;
+            }
+          }
+
+          out('name', pkg.name);
+          out('version', tagVersion);
+          out('dist_tag', distTag);
+          out('package_path', realPkgDir);
+          NODE
+
+      - name: Install dependencies (lockfile-aware, no lifecycle scripts)
+        if: success()
+        working-directory: ${{ inputs.package-directory }}
+        run: |
+          set -euo pipefail
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            echo "Lockfile detected; using 'npm ci --ignore-scripts'."
+            npm ci --ignore-scripts
+          else
+            echo "No lockfile detected; using 'npm install --ignore-scripts --no-audit --no-fund'."
+            npm install --ignore-scripts --no-audit --no-fund
+          fi
+
       - name: Run caller test command
+        if: success()
+        working-directory: ${{ inputs.package-directory }}
+        env:
+          HOME: ${{ runner.temp }}/home
         run: ${{ inputs.test-command }}
 
+      - name: Pack tested source and compose release metadata
+        if: success()
+        id: pack
+        working-directory: ${{ inputs.package-directory }}
+        env:
+          APPROVED_NAME: ${{ steps.resolve.outputs.name }}
+          APPROVED_VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pack"
+          mkdir -p "$RUNNER_TEMP/meta"
+          pack_json="$(npm pack --ignore-scripts --json --pack-destination "$RUNNER_TEMP/pack")"
+          node - "$pack_json" "$APPROVED_NAME" "$APPROVED_VERSION" <<'NODE'
+          'use strict';
+          const fs = require('fs');
+          const path = require('path');
+          const crypto = require('crypto');
+
+          const [raw, approvedName, approvedVersion] = process.argv.slice(2);
+          let arr;
+          try { arr = JSON.parse(raw); }
+          catch (e) { die('PACK_JSON not JSON: ' + e.message); }
+          if (!Array.isArray(arr) || arr.length !== 1) die('npm pack --json must produce array of length 1; got ' + arr.length);
+          const entry = arr[0];
+          if (!entry.filename) die('pack entry missing filename');
+          if (entry.name !== approvedName) {
+            die('pack entry name does not match approved name: ' + entry.name + ' != ' + approvedName);
+          }
+          if (entry.version !== approvedVersion) {
+            die('pack entry version does not match approved version: ' + entry.version + ' != ' + approvedVersion);
+          }
+          if (entry.filename !== path.basename(entry.filename)) {
+            die('pack filename is not a plain basename: ' + entry.filename);
+          }
+          const tarballPath = path.join(process.env.RUNNER_TEMP, 'pack', entry.filename);
+          if (!fs.existsSync(tarballPath)) die('pack tarball missing: ' + tarballPath);
+          const bytes = fs.readFileSync(tarballPath);
+          // Canonical SRI: 'sha512-' + base64 (NOT 'sha512~' which is not a valid SRI prefix).
+          const sha512B64 = crypto.createHash('sha512').update(bytes).digest('base64');
+          const integrity = 'sha512-' + sha512B64;
+          if (entry.integrity !== integrity) die('pack integrity does not match tarball bytes');
+          const meta = {
+            name: approvedName,
+            version: approvedVersion,
+            filename: entry.filename,
+            integrity
+          };
+          fs.writeFileSync(path.join(process.env.RUNNER_TEMP, 'meta', 'release-metadata.json'), JSON.stringify(meta, null, 2));
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, 'tarball_path=' + tarballPath + '\n');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, 'tarball_filename=' + entry.filename + '\n');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, 'metadata_path=' + path.join(process.env.RUNNER_TEMP, 'meta', 'release-metadata.json') + '\n');
+          console.log(JSON.stringify(meta, null, 2));
+
+          function die(m) { console.error(m); process.exit(1); }
+          NODE
+
+      - name: Upload packed tarball
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: npm-tarball-${{ inputs.tag }}
+          path: ${{ runner.temp }}/pack/
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload release metadata
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-metadata-${{ inputs.tag }}
+          path: ${{ steps.pack.outputs.metadata_path }}
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
-    name: npm publish
-    needs: test
+    name: npm publish (OIDC)
+    needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write # required for `npm publish --provenance`
+      id-token: write
     concurrency:
       group: npm-publish-${{ github.repository }}-${{ inputs.tag }}
       cancel-in-progress: false
     env:
       TAG: ${{ inputs.tag }}
-      VERSION_FILE: ${{ inputs.version-file }}
+      PROVENANCE: ${{ inputs.provenance }}
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          ref: ${{ inputs.tag }}
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: ${{ inputs.node-version }}
-          registry-url: https://registry.npmjs.org
 
-      - name: Validate tag against package.json and the version file
-        id: resolve
+      - name: Verify npm runtime meets trusted publisher minimum
         run: |
           set -euo pipefail
-
-          semver_tag_pattern='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$'
-          if ! [[ "$TAG" =~ $semver_tag_pattern ]]; then
-            echo "Tag is not canonical v-prefixed SemVer: $TAG"
-            exit 1
-          fi
-          tag_version="${TAG#v}"
-
-          if [ ! -f package.json ]; then
-            echo "package.json does not exist at $TAG; nothing to publish."
-            exit 1
-          fi
-          package_name="$(node -p 'require("./package.json").name')"
-          package_version="$(node -p 'require("./package.json").version || ""')"
-          if [ "$package_version" != "$tag_version" ]; then
-            echo "Tag $TAG does not match package.json version ${package_version:-<absent>}"
+          node -e 'const [major, minor] = process.versions.node.split(".").map(Number); if (major < 22 || (major === 22 && minor < 14)) throw Error("Node >=22.14 required");'
+          IFS=. read -r npm_major npm_minor npm_patch <<<"$(npm -v)"
+          if [ "$npm_major" -lt 11 ] || { [ "$npm_major" = "11" ] && { [ "$npm_minor" -lt 5 ] || { [ "$npm_minor" = "5" ] && [ "$npm_patch" -lt 1 ]; }; }; }; then
+            echo "npm >= 11.5.1 required for npm trusted publishers; found $(npm -v)"
             exit 1
           fi
 
-          if [ ! -f "$VERSION_FILE" ]; then
-            echo "Version file does not exist: $VERSION_FILE"
-            exit 1
-          fi
-          case "$VERSION_FILE" in
-            *.json)
-              source_version="$(node -p 'require("./" + process.env.VERSION_FILE).version || ""')"
-              if [ -z "$source_version" ]; then
-                echo "Version file has no version field: $VERSION_FILE"
-                exit 1
-              fi
-              ;;
-            *)
-              version_count="$(grep -Ec '^version: [^[:space:]]+$' "$VERSION_FILE" || true)"
-              if [ "$version_count" != "1" ]; then
-                echo "Version file must contain exactly one version field: $VERSION_FILE"
-                exit 1
-              fi
-              source_version="$(sed -nE 's/^version: ([^[:space:]]+)$/\1/p' "$VERSION_FILE")"
-              ;;
-          esac
-          if [ "$source_version" != "$tag_version" ]; then
-            echo "Tag $TAG does not match $VERSION_FILE version $source_version"
-            exit 1
-          fi
+      - name: Download packed tarball
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: npm-tarball-${{ inputs.tag }}
+          path: ${{ runner.temp }}/downloaded/npm-tarball-${{ inputs.tag }}
 
-          # A lifecycle script would execute on every consumer install, including every `npx`
-          # invocation by someone who has not read this package.
-          for hook in preinstall install postinstall prepare; do
-            if [ "$(node -p "String(Boolean((require('./package.json').scripts||{})['$hook']))")" = "true" ]; then
-              echo "package.json declares a '$hook' script; refusing to publish."
-              exit 1
-            fi
-          done
+      - name: Download release metadata
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-metadata-${{ inputs.tag }}
+          path: ${{ runner.temp }}/downloaded/release-metadata-${{ inputs.tag }}
 
-          # The dist-tag is the prerelease identifier, so `-beta.N` publishes under `beta` and
-          # `-rc.N` under `rc`; a stable tag publishes under `latest`.
-          if [[ "$tag_version" == *-* ]]; then
-            prerelease="${tag_version#*-}"
-            dist_tag="${prerelease%%.*}"
-          else
-            dist_tag=latest
-          fi
-
-          echo "name=$package_name" >> "$GITHUB_OUTPUT"
-          echo "version=$tag_version" >> "$GITHUB_OUTPUT"
-          echo "dist_tag=$dist_tag" >> "$GITHUB_OUTPUT"
-          echo "Publishing $package_name@$tag_version under dist-tag $dist_tag"
-
-      - name: Check whether this version is already published
-        id: existing
+      - name: Verify local artifact and load metadata
+        id: load
         env:
-          NAME: ${{ steps.resolve.outputs.name }}
-          VERSION: ${{ steps.resolve.outputs.version }}
+          APPROVED_NAME: ${{ needs.build.outputs.name }}
+          APPROVED_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          'use strict';
+          const fs = require('fs');
+          const path = require('path');
+          const crypto = require('crypto');
+
+          function out(k, v) {
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `${k}=${v}\n`);
+          }
+          function die(m) { console.error(m); process.exit(1); }
+
+          const root = path.join(process.env.RUNNER_TEMP, 'downloaded');
+          const tgzDir = path.join(root, 'npm-tarball-' + process.env.TAG);
+          const metaDir = path.join(root, 'release-metadata-' + process.env.TAG);
+          if (!fs.existsSync(tgzDir)) die('tarball artifact missing: ' + tgzDir);
+          if (!fs.existsSync(metaDir)) die('metadata artifact missing: ' + metaDir);
+          const tgzs = fs.readdirSync(tgzDir).filter(f => f.endsWith('.tgz'));
+          if (tgzs.length !== 1) die('expected exactly one tarball; got ' + tgzs.length);
+          const tarballPath = path.join(tgzDir, tgzs[0]);
+          const metaFiles = fs.readdirSync(metaDir).filter(f => f.endsWith('.json'));
+          if (metaFiles.length !== 1) die('expected exactly one metadata file; got ' + metaFiles.length);
+          const metaPath = path.join(metaDir, metaFiles[0]);
+          const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+          for (const k of ['name', 'version', 'filename', 'integrity']) {
+            if (!meta[k] || typeof meta[k] !== 'string') die('metadata missing field: ' + k);
+          }
+          const bytes = fs.readFileSync(tarballPath);
+          const localIntegrity = 'sha512-' + crypto.createHash('sha512').update(bytes).digest('base64');
+          if (localIntegrity !== meta.integrity) die('local tarball integrity does not match metadata');
+          if (meta.filename !== path.basename(tarballPath)) die('metadata.filename does not match tarball basename');
+          if (meta.name !== process.env.APPROVED_NAME) die('metadata.name does not match approved name');
+          if (meta.version !== process.env.APPROVED_VERSION) die('metadata.version does not match approved version');
+
+          out('name', meta.name);
+          out('version', meta.version);
+          out('integrity', meta.integrity);
+          out('tarball_path', tarballPath);
+          NODE
+
+      - name: Probe exact-version endpoint on the registry
+        id: probe
+        env:
+          NAME: ${{ steps.load.outputs.name }}
+          VERSION: ${{ steps.load.outputs.version }}
         run: |
           set -uo pipefail
-          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "$NAME@$VERSION is already published; re-running this tag is a no-op."
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+          # Exact-version endpoint avoids the package-index "missing new version" false 404.
+          # HTTP 404 means the version is absent (publish path); HTTP 200 means present
+          # (integrity path). Anything else is outage/auth/malformed and fails.
+          encoded_name="$(node -p 'encodeURIComponent(process.argv[1])' "$NAME")"
+          encoded_version="$(node -p 'encodeURIComponent(process.argv[1])' "$VERSION")"
+          url="https://registry.npmjs.org/${encoded_name}/${encoded_version}"
+          body_path="${{ runner.temp }}/registry-version-body"
+          http_status="$(curl -sS -o "$body_path" -w '%{http_code}' --max-time 30 -H 'Accept: application/json' "$url")"
+          if [ "$http_status" = "404" ]; then
+            echo "status=404" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
+          if [ "$http_status" = "200" ]; then
+            if ! node -p 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))' "$body_path" >/dev/null; then
+              echo "Registry returned 200 but body is not valid JSON; failing."
+              exit 1
+            fi
+            echo "status=200" >> "$GITHUB_OUTPUT"
+            echo "body_path=$body_path" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Registry returned HTTP $http_status for $NAME@$VERSION; treating as outage/auth/malformed and failing."
+          exit 1
+
+      - name: Verify already-published registry bytes match the tested artifact
+        if: steps.probe.outputs.status == '200'
+        env:
+          NAME: ${{ steps.load.outputs.name }}
+          VERSION: ${{ steps.load.outputs.version }}
+          INTEGRITY: ${{ steps.load.outputs.integrity }}
+          BODY_PATH: ${{ steps.probe.outputs.body_path }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          'use strict';
+          const fs = require('fs');
+          const crypto = require('crypto');
+
+          const { BODY_PATH: bodyPath, NAME: name, VERSION: version, INTEGRITY: integrity } = process.env;
+          const doc = JSON.parse(fs.readFileSync(bodyPath, 'utf8'));
+          if (doc.name !== name) {
+            console.error('Registry name mismatch:', doc.name, '!=', name);
+            process.exit(1);
+          }
+          if (doc.version !== version) {
+            console.error('Registry version mismatch:', doc.version, '!=', version);
+            process.exit(1);
+          }
+          const declared = doc.dist && doc.dist.integrity;
+          if (!declared) {
+            console.error('Registry entry has no dist.integrity');
+            process.exit(1);
+          }
+          // Canonical 'sha512-<base64>' SRI prefix. Compare verbatim.
+          if (declared !== integrity) {
+            console.error('Registry integrity does not match tested artifact:');
+            console.error('  registry:', declared);
+            console.error('  artifact:', integrity);
+            process.exit(1);
+          }
+          // Fetch and re-hash the registry tarball bytes (URL from dist.tarball, scoped-safe).
+          const tarballUrl = doc.dist && doc.dist.tarball;
+          if (!tarballUrl) {
+            console.error('Registry entry has no dist.tarball');
+            process.exit(1);
+          }
+          (async () => {
+            const res = await fetch(tarballUrl, { redirect: 'follow' });
+            if (!res.ok) {
+              console.error('Registry tarball fetch failed:', res.status, tarballUrl);
+              process.exit(1);
+            }
+            const buf = Buffer.from(await res.arrayBuffer());
+            const registrySha = 'sha512-' + crypto.createHash('sha512').update(buf).digest('base64');
+            if (registrySha !== integrity) {
+              console.error('Registry tarball SHA512 differs from tested artifact:');
+              console.error('  registry:', registrySha);
+              console.error('  artifact:', integrity);
+              process.exit(1);
+            }
+            console.log('Registry metadata and tarball bytes match the tested artifact.');
+          })().catch(e => { console.error(e); process.exit(1); });
+          NODE
 
       - name: Publish
-        if: steps.existing.outputs.exists == 'false'
+        if: steps.probe.outputs.status == '404'
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.npm-token }}
-          DIST_TAG: ${{ steps.resolve.outputs.dist_tag }}
-        run: npm publish --provenance --access public --tag "$DIST_TAG"
+          DIST_TAG: ${{ needs.build.outputs.dist_tag }}
+          TARBALL: ${{ steps.load.outputs.tarball_path }}
+          NPM_CONFIG_PROVENANCE: ${{ inputs.provenance == 'true' && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          publish_args=(npm publish --ignore-scripts --access public --tag "$DIST_TAG")
+          if [ "$PROVENANCE" = "true" ]; then
+            publish_args+=(--provenance)
+          fi
+          publish_args+=("$TARBALL")
+          "${publish_args[@]}"
